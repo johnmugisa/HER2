@@ -1,0 +1,41 @@
+{
+  "expression": "Rs + 1/((pow(s,nh)*Qh) + 1/(Rct + 1/(s*C1 + 1/R1)))",
+  "variables": [
+    {
+      "name": "Rs",
+      "initialValue": 5,
+      "lowerBound": 1e-15,
+      "upperBound": 1e15
+    },
+    {
+      "name": "Qh",
+      "initialValue": 0.001,
+      "lowerBound": 1e-15,
+      "upperBound": 1e1
+    },
+    {
+      "name": "nh",
+      "initialValue": 0.75,
+      "lowerBound": 1e-1,
+      "upperBound": 1e0
+    },
+    {
+      "name": "Rct",
+      "initialValue": 20,
+      "lowerBound": 1e-15,
+      "upperBound": 1e15
+    },
+    {
+      "name": "R1",
+      "initialValue": 20,
+      "lowerBound": 1e-15,
+      "upperBound": 1e15
+    },
+    {
+      "name": "C1",
+      "initialValue": 0.01,
+      "lowerBound": 1e-15,
+      "upperBound": 1e15
+    }
+  ]
+}

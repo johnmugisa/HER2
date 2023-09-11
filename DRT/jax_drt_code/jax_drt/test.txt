@@ -1,0 +1,388 @@
+import numpy as np
+import pandas as pd
+import jax
+import jax.numpy as jnp
+import jaxopt
+from jaxopt import ProjectedGradient
+from scipy.signal import find_peaks, peak_widths
+from scipy.optimize import least_squares
+from jaxopt.objective import ridge_regression
+from scipy.optimize import least_squares
+import time
+from PlotsSolver import Plotter
+
+import cmath as cm
+
+# --- For the main procedure and parameters see bottom part of this file
+
+def ZWarburg():
+    fmin = 0.01
+    fmax = 1e4
+    omega = jnp.zeros(1)
+    omega = omega.at[0].set(2 * jnp.pi * fmin)
+    alpha = 0.1103363182  # --- 22 points per decade
+    for n in range(1000):
+        omega = jnp.append(omega, (1 + alpha) * omega[-1])
+        if omega[-1] > 2 * jnp.pi * fmax:
+            break
+    omega = jnp.delete(omega, -1)  # --- remove last omega from the array
+    omega = omega[::-1] # --- reverse order of elements in omega
+    print('omega max =', omega[0], ', omega size = ', omega.size)
+    tast = 1
+    zWarb = jnp.zeros(omega.shape[0], dtype=jnp.complex128)
+    for k in range(omega.shape[0]):
+        psi = cm.sqrt(1j * tast * omega[k])
+        zWarb = zWarb.at[k].set(cm.tanh(psi) / psi)
+    zrew = zWarb.real
+    zimw = - zWarb.imag
+    return omega, zrew, zimw   # --- omega is in descending order!
+
+def user_data():
+    data = pd.read_csv('./immfit1.csv', sep=',', header=None)
+    dflat = np.array(data)
+    omgu = dflat[:, 0] * 2 * np.pi
+    zreu = dflat[:, 1]
+    zimu = np.abs(dflat[:, 2])
+    return jnp.array(omgu), jnp.array(zreu), jnp.array(zimu)
+
+
+fname = './results/Warburg_'   # --- Prefix for output files name
+
+lamT0 = 1e-14   # --- Initial guess for Tikhonov reg. parameter
+lampg0 = 0.01   # --- Initial guess for PG reg. parameter
+mode = 'real'   # --- Use real part of impedance for DRT calculation.
+                # --- Set mode = 'imag' to use imaginary part.
+
+omg, zre, zim = ZWarburg()
+
+# --- To supply your data, comment or remove the previous line and
+# --- uncomment the next line:
+omg, zre, zim = user_data()
+
+rpol = zre[-1] - zre[0]
+zexp_re_norm = zre / rpol
+zexp_im_norm = zim / rpol
+tau = 1 / omg
+niter = 1000
+lntau = jnp.log(tau)
+am = jnp.zeros((omg.size, omg.size), dtype=jnp.float64)
+
+
+def create_dmesh(grid, omg):
+    dh = jnp.zeros(omg.size, dtype=jnp.float64)
+    for j in range(1, omg.size - 1):
+        dh = dh.at[j].set(0.5 * (grid[j + 1] - grid[j - 1]))
+    dh = dh.at[0].set(0.5 * (grid[1] - grid[0]))
+    dh = dh.at[-1].set(0.5 * (grid[-1] - grid[-2]))
+    return dh
+
+dlntau = create_dmesh(lntau, omg)
+dtau = create_dmesh(tau, omg)
+Idm = jnp.identity(omg.size, dtype=jnp.integer)
+
+def CreateTikhMatrix(am, dlntau, mode, omg, tau, lamT0, zexp_re_norm, zexp_im_norm):
+    for i in range(omg.size):
+        prod = omg[i] * tau
+        if mode == 'real':
+            am = am.at[i, :].set(dlntau / (1 + prod**2))
+        else:
+            am = am.at[i, :].set(prod * dlntau / (1 + prod**2))
+
+    amT = am.transpose()
+    amTam = jnp.matmul(amT, am)
+    amTikh = amTam + lamT0 * jnp.identity(omg.size, dtype=jnp.integer)
+
+    if mode == 'real':
+        brs = jnp.matmul(amT, zexp_re_norm)
+    else:
+        brs = jnp.matmul(amT, zexp_im_norm)
+
+    return am, amT, amTam, amTikh, brs
+
+
+def Tikh_solver(lamt, am):
+    am, _, amTam, amTikh, brs = CreateTikhMatrix(am, dlntau, mode, omg, tau, lamT0, zexp_re_norm, zexp_im_norm)
+    amTikh = amTam + lamt * Idm  # --- new Tikhonov matrix
+    sol, residuals, rank, sv = jnp.linalg.lstsq(amTikh, brs, rcond=None)
+    return sol
+
+
+def objective_fun(amTikh, brs, gtau):
+    return jnp.sum((jnp.matmul(amTikh, gtau) - brs) ** 2)
+
+
+def projection_fun(gtau, *args, **kwargs):
+    return jnp.clip(gtau, 0.0, None)
+
+
+
+def pg_solver(amTikh, brs, lamT, lampg):
+    gtau = Tikh_solver(lamT, am)  # --- initial Gfun from Tikhonov solver
+
+    objective = lambda gtau: objective_fun(amTikh, brs, gtau)
+    projection = projection_fun
+
+    pg = ProjectedGradient(fun=objective, projection=projection, maxiter=niter * 1000)
+    solution = pg.run(gtau, lampg)
+    rpoly = np.sum(solution.params * create_dmesh(jnp.log(1 / omg), omg))
+
+    return solution.params, rpoly, solution.state.iter_num
+
+
+def Tikh_residual(amTikh, brs, lamT, lampg):
+    gfvec, rp, kk = pg_solver(amTikh, brs, lamT, lampg)
+    resid = jnp.matmul(amTikh, gfvec) - brs
+    return resid
+
+
+def least_squares_solver(amTikh, brs, lamvecinit, gfun_init, lamT0):
+    lamT, lampg = lamvecinit
+
+    lm = jaxopt.LevenbergMarquardt(Tikh_residual, tol=1e-8, xtol=1e-8,
+        gtol=1e-8)
+
+    lm_sol = lm.run(amTikh, brs, lamT, lampg)
+    return lm_sol.params
+
+
+def driver(omg, tau, zexp_re_norm, zexp_im_norm, lamT0, lampg0):
+    niter = 10
+    grid = jnp.log(1 / omg)
+    dlntau = jnp.zeros(omg.size, dtype=jnp.float64)
+    am = jnp.zeros((omg.size, omg.size), dtype=jnp.float64)
+
+    for i in range(1, omg.size):
+        dlntau = dlntau.at[i].set(grid[i] - grid[i - 1])
+
+    am, amT, amTam, amTikh, brs = CreateTikhMatrix(am, dlntau, 'real', omg, tau, lamT0, zexp_re_norm, zexp_im_norm)
+
+    gfun_init = Tikh_solver(lamT0, am)
+
+    lamvecinit = jnp.array([lamT0, lampg0], dtype=jnp.float64)
+    resparm = least_squares_solver(amTikh, brs, lamvecinit, gfun_init, lamT0)
+
+    return resparm
+
+res = driver(omg, tau, zexp_re_norm, zexp_im_norm, lamT0, lampg0)
+print(res)
+
+
+# import numpy as np
+# import jax
+# import jax.numpy as jnp
+# import jaxopt
+# from jaxopt import ProjectedGradient
+# from scipy.signal import find_peaks, peak_widths
+# from jaxopt.objective import ridge_regression
+# from scipy.optimize import least_squares
+# import time
+# from PlotsSolver import Plotter
+
+
+# class TikhPGSolver:
+#     def __init__(self, zexp_re, zexp_im, omg, mode, lamT0, lampg0):
+#         self.rpol = zexp_re[-1] - zexp_re[0]
+#         self.zexp_re = zexp_re
+#         self.zexp_im = zexp_im
+#         self.zexp_re_norm = zexp_re / self.rpol
+#         self.zexp_im_norm = zexp_im / self.rpol
+#         self.omg = omg
+#         self.mode = mode
+#         self.lamT0 = lamT0
+#         self.lampg0 = lampg0
+#         self.niter = 80
+#         self.flagiter = 0
+
+#         self.tau = 1 / self.omg
+#         self.lntau = jnp.log(self.tau)
+#         self.dlntau = self.create_dmesh(self.lntau)
+#         self.dtau = self.create_dmesh(self.tau)
+#         self.Idm = jnp.identity(self.omg.size, dtype=jnp.integer)
+#         self.am = jnp.zeros((self.omg.size, self.omg.size), dtype=jnp.float64)
+#         self.CreateTikhMatrix()
+
+#     def create_dmesh(self, grid):
+#         dh = jnp.zeros(self.omg.size, dtype=jnp.float64)
+#         for j in range(1, self.omg.size - 1):
+#             dh = dh.at[j].set(0.5 * (grid[j + 1] - grid[j - 1]))
+#         dh = dh.at[0].set(0.5 * (grid[1] - grid[0]))
+#         dh = dh.at[-1].set(0.5 * (grid[-1] - grid[-2]))
+#         return dh
+
+#     def CreateTikhMatrix(self):
+#         for i in range(self.omg.size):
+#             prod = self.omg[i] * self.tau
+#             if self.mode == 'real':
+#                 self.am = self.am.at[i, :].set(self.dlntau / (1 + prod**2))
+#             else:
+#                 self.am = self.am.at[i, :].set(prod * self.dlntau / (1 + prod**2))
+
+#         self.amT = self.am.transpose()
+#         self.amTam = jnp.matmul(self.amT, self.am)
+#         self.amTikh = self.amTam + self.lamT0 * self.Idm
+
+#         if self.mode == 'real':
+#             self.brs = jnp.matmul(self.amT, self.zexp_re_norm)
+#         else:
+#             self.brs = jnp.matmul(self.amT, self.zexp_im_norm)
+
+#     def Tikh_solver(self, lamt):
+#         self.amTikh = self.amTam + lamt * self.Idm
+#         sol = jnp.linalg.solve(self.amTikh, self.brs)
+#         return sol
+
+#     def objective_fun(self, gtau):
+#         return jnp.sum((jnp.matmul(self.amTikh, gtau) - self.brs) ** 2)
+
+#     def projection_fun(self, gtau):
+#         return jnp.clip(gtau, 0.0, None)
+
+#     def pg_solver(self, lamvec):
+#         lamT, lampg = lamvec
+#         gtau = self.Tikh_solver(lamT)
+
+#         objective = self.objective_fun
+#         projection = self.projection_fun
+
+#         pg = ProjectedGradient(fun=objective, projection=projection, maxiter=self.niter * 1000)
+#         solution = pg.run(gtau, lampg)
+#         rpoly = np.sum(solution.params * self.dlntau)
+
+#         return solution.params, rpoly, solution.state.iter_num
+
+#     def Tikh_residual(self, lamvec):
+#         gfvec, rp, kk = self.pg_solver(lamvec)
+#         resid = jnp.matmul(self.amTikh, gfvec) - self.brs
+#         return resid
+
+#     def jacoby(self, pvec):
+#         return jax.jacobian(self.Tikh_residual)(jnp.array(pvec))
+
+#     def Tikh_residual_norm(self, gtau, lamT):
+#         self.amTikh = self.amTam + lamT * self.Idm
+#         work = jnp.matmul(self.amTikh, gtau)
+#         sumres = jnp.sqrt(jnp.sum((work - self.brs)**2))
+#         sumlhs = jnp.sqrt(jnp.sum(work**2))
+#         return sumres, sumlhs
+
+#     def residual_norm(self, gtau):
+#         work = jnp.matmul(self.amTam, gtau)
+#         normres = jnp.sqrt(jnp.sum((work - self.brs)**2))
+#         return normres
+
+#     def Zmodel_imre(self, gtau):
+#         zmod = jnp.zeros(self.omg.size, dtype=jnp.float64)
+#         for i in range(self.omg.size):
+#             prod = self.omg[i] * self.tau
+#             if self.mode == 'real':
+#                 integrand = gtau / (1 + prod ** 2)
+#             else:
+#                 integrand = prod * gtau / (1 + prod ** 2)
+#             zmod = zmod.at[i].set(jnp.sum(self.dlntau * integrand))
+#         return jnp.flip(self.rpol * zmod)
+
+#     def rpol_peaks(self, gtau):
+#         peaks, dummy = find_peaks(np.asarray(gtau.copy()), prominence=0.01)
+#         width = peak_widths(gtau, peaks, rel_height=1)
+
+#         integr = jnp.zeros(peaks.size, dtype=jnp.float64)
+#         for n in range(peaks.size):
+#             lb, ub = int(width[2][n]), int(width[3][n])
+#             integr = integr.at[n].set(jnp.sum(gtau[lb:ub] * self.dlntau[lb:ub]))
+
+#         pparms = jnp.zeros((2, peaks.size), dtype=jnp.float64)
+#         pparms = pparms.at[0, :].set(jnp.flip(1 / (2 * jnp.pi * self.tau[peaks])))
+#         pparms = pparms.at[1, :].set(jnp.flip(integr))
+#         return pparms
+
+#     def driver(self, lsq):
+#         myplots = Plotter(self.zexp_re, self.zexp_im, self.omg, self.mode)
+
+#         gfun_init = self.Tikh_solver(self.lamT0)
+
+#         start = time.time()
+#         lamvecinit = jnp.array([self.lamT0, self.lampg0], dtype=jnp.float64)
+#         low, high = lamvecinit / 10, lamvecinit * 10
+
+#         if lsq == 'lm':
+#             resparm = least_squares(self.Tikh_residual, lamvecinit,
+#                                     jac=self.jacoby, method='lm', args=(), kwargs={'gfun_init': gfun_init, 'lamT0': self.lamT0})
+#         else:
+#             resparm = least_squares(self.Tikh_residual, lamvecinit, bounds=(low, high),
+#                                     jac=self.jacoby, args=(), kwargs={'gfun_init': gfun_init, 'lamT0': self.lamT0})
+#         res = resparm.x
+
+#         gfun, rpoly, nit = self.pg_solver(res)
+#         end = time.time()
+#         print('Projected gradient iterations =', nit, ', rpol =', rpoly,
+#             ', Rpol = ', self.rpol)
+#         print('lamTfit, lampgfit =', res, ', elapsed: ', (end - start), ' sec')
+
+#         resinit, lhsinit = self.Tikh_residual_norm(gfun_init, self.lamT0)
+#         resfin, lhsfin = self.Tikh_residual_norm(gfun, res[0])
+#         print('Tikhonov residual: initial, final = ', resinit, resfin)
+#         print('Tikhonov lhs norm: initial, final =', lhsinit, lhsfin)
+#         if resparm.status > 0:
+#             print('Number of Jacobian evaluations =', resparm.njev, ', status = OK')
+#         if self.flagiter == 1:
+#             print('Warning, limiting number of iterations is achieved')
+
+#         myplots.plotGfun(gfun, self.fname + 'Gfun', 1, 'Final G-function')
+#         zmod = self.Zmodel_imre(gfun)
+#         myplots.plotshow_Z(zmod, self.fname + self.fsuffix, 1, '')
+#         peakparms = self.rpol_peaks(gfun)
+
+#         print('Peak frequencies (beta):   ', ''.join(['{:.5f}  '.format(item) for item in peakparms[0]]))
+#         print('Peak polarizations (beta): ', ''.join(['{:.5f}  '.format(item) for item in peakparms[1]]))
+gvec is [0.         0.00291207 0.01761592 0.00654139 0.         0.
+ 0.06940547 0.17311858 0.24941715 0.27245832 0.23249764 0.15244571
+ 0.08822675 0.07958156 0.12203376 0.17564461 0.17048587 0.03880477
+ 0.         0.         0.         0.         0.         0.
+ 0.         0.         0.         0.         0.         0.
+ 0.         0.         0.         0.         0.         0.
+ 0.         0.         0.         0.         0.45954483 0.81398684
+ 0.73251451 0.14548647 0.         0.         0.         0.
+ 0.         0.         0.         0.         0.         0.        ] and the shape of gvec is (54,)
+
+
+ 2.80509099e-01, 4.26781435e-01, 2.73759066e-01,
+             1.23265738e-01, 5.60218560e-06, 7.05779175e-06,
+             3.57876727e-04, 1.66121728e-03, 1.50878560e-03,
+             4.93414579e-02, 1.60420248e-01, 2.62958440e-01,
+             3.28294133e-01, 3.31852891e-01, 2.47826783e-01,
+             6.00207134e-02, 1.94061049e-03, 3.12893792e-03,
+             2.89334188e-03, 1.73585383e-03, 6.13811383e-06,
+             1.12670810e-05, 0.00000000e+00, 0.00000000e+00,
+             0.00000000e+00, 0.00000000e+00, 0.00000000e+00,
+             0.00000000e+00, 0.00000000e+00, 0.00000000e+00,
+             0.00000000e+00, 0.00000000e+00, 0.00000000e+00,
+             0.00000000e+00, 0.00000000e+00, 0.00000000e+00,
+             0.00000000e+00, 4.80971392e-03, 4.80840613e-02,
+             4.80300254e-02, 5.08747821e-01, 6.92044756e-01,
+             5.92994145e-01, 2.56814099e-01, 0.00000000e+00,
+             0.00000000e+00, 0.00000000e+00, 0.00000000e+00,
+             0.00000000e+00, 0.00000000e+00, 0.00000000e+00,
+             0.00000000e+00, 0.00000000e+00, 0.00000000e+00]
+
+
+
+
+
+
+
+Projected gradient iterations = 4875 , rpol = 1.048862330740854 , Rpol =  39.24
+lamTfit, lampgfit = [1.e-14 1.e-02] , elapsed:  5.476156711578369  sec
+Tikhonov residual: initial, final =  2.4770044141907795e-10 0.019750685114450498
+Tikhonov lhs norm: initial, final = 38.21404752289802 38.21404313513901
+Number of Jacobian evaluations = None , status = OK
+
+lamTfit, lampgfit = [2.17264224e-15 1.66171990e-02] , elapsed:  34.43898010253906  sec
+Tikhonov residual: initial, final =  1.7050973942302534e-08 0.022484219241954356
+Tikhonov lhs norm: initial, final = 38.214047519280236 38.22088174553454
+Number of Jacobian evaluations = 4 , status = OK
+Warning, limiting number of iterations is achieved
+Peak frequencies (beta):    2.33000  748.00000  6100.00000  49800.00000
+Peak polarizations (beta):  0.56483  0.00728  0.48403  0.01789
+
+Peak frequencies (beta):    2.33000  1640.00000  10300.00000  64700.00000
+Peak polarizations (beta):  0.56388  0.09650  0.47774  0.00868 
