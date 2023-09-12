@@ -69,7 +69,7 @@ def update_output(contents, filename):
             # data = data.applymap(lambda x: float(x.replace(',', '.')) if isinstance(x, str) else x)
             # Convert the comma to a dot if the numbers are in the European format
             data = data.apply(lambda x: x.str.replace(',', '.') if x.dtype == "object" else x).astype(float)
-
+            # this is an alternative method
             # List of cycle numbers to plot
             cycles_to_plot = [2,3,4,5,6,7,8,9]
 
